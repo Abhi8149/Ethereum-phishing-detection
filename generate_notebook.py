@@ -1,0 +1,1066 @@
+import json
+
+cells = []
+
+# ==================== MARKDOWN: Title ====================
+cells.append({
+    "cell_type": "markdown",
+    "metadata": {},
+    "source": [
+        "# GNN-Based Phishing Account Detection in Ethereum\n",
+        "## Model Architecture & Training\n",
+        "\n",
+        "Implementation of:\n",
+        "1. **GAE_PDNA** - Graph AutoEncoder with Pathfinder Discovery Network layers\n",
+        "2. **MagNet Link Prediction** - Directed graph link prediction\n",
+        "3. **Embedding Baselines** - DeepWalk, Node2Vec\n",
+        "4. **Classifiers** - AdaBoost, Random Forest, SVM, Naive Bayes, Logistic Regression\n",
+        "\n",
+        "Based on: *Ratra et al., \"Graph neural network based phishing account detection in Ethereum\", The Computer Journal, 2024*"
+    ]
+})
+
+# ==================== CODE: Installation ====================
+cells.append({
+    "cell_type": "code",
+    "metadata": {},
+    "source": [
+        "# ============================================================\n",
+        "# 1. INSTALLATION\n",
+        "# ============================================================\n",
+        "!pip install -q torch torch-geometric torch-sparse torch-scatter\n",
+        "!pip install -q imbalanced-learn node2vec gensim scikit-learn\n",
+        "!pip install -q matplotlib seaborn\n",
+        "print('All packages installed.')"
+    ],
+    "outputs": [],
+    "execution_count": None
+})
+
+# ==================== CODE: Imports ====================
+cells.append({
+    "cell_type": "code",
+    "metadata": {},
+    "source": [
+        "# ============================================================\n",
+        "# 2. IMPORTS\n",
+        "# ============================================================\n",
+        "import numpy as np\n",
+        "import pandas as pd\n",
+        "import torch\n",
+        "import torch.nn as nn\n",
+        "import torch.nn.functional as F\n",
+        "from torch.optim import Adam\n",
+        "\n",
+        "from torch_geometric.data import Data\n",
+        "from torch_geometric.nn import PDNConv, GCNConv\n",
+        "from torch_geometric.nn.norm import GraphNorm\n",
+        "from torch_geometric.transforms import RandomLinkSplit\n",
+        "from torch_geometric.utils import negative_sampling\n",
+        "\n",
+        "from sklearn.model_selection import train_test_split\n",
+        "from sklearn.ensemble import AdaBoostClassifier, RandomForestClassifier\n",
+        "from sklearn.tree import DecisionTreeClassifier\n",
+        "from sklearn.svm import OneClassSVM\n",
+        "from sklearn.naive_bayes import GaussianNB\n",
+        "from sklearn.linear_model import LogisticRegression\n",
+        "from sklearn.metrics import (\n",
+        "    classification_report, precision_score,\n",
+        "    recall_score, f1_score, roc_auc_score\n",
+        ")\n",
+        "from sklearn.preprocessing import MinMaxScaler\n",
+        "\n",
+        "from imblearn.over_sampling import SMOTE\n",
+        "from imblearn.under_sampling import RandomUnderSampler\n",
+        "from imblearn.pipeline import Pipeline as ImbPipeline\n",
+        "\n",
+        "from sklearn.manifold import TSNE\n",
+        "import matplotlib.pyplot as plt\n",
+        "import seaborn as sns\n",
+        "import warnings\n",
+        "warnings.filterwarnings('ignore')\n",
+        "\n",
+        "device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')\n",
+        "print(f'Using device: {device}')"
+    ],
+    "outputs": [],
+    "execution_count": None
+})
+
+# ==================== MARKDOWN: Load Dataset ====================
+cells.append({
+    "cell_type": "markdown",
+    "metadata": {},
+    "source": [
+        "## 3. Load Dataset\n",
+        "\n",
+        "Upload `node_features_labeled.csv` and `transactions_clean.csv` to Colab."
+    ]
+})
+
+# ==================== CODE: Upload files ====================
+cells.append({
+    "cell_type": "code",
+    "metadata": {},
+    "source": [
+        "# ============================================================\n",
+        "# 3. UPLOAD DATA FILES\n",
+        "# ============================================================\n",
+        "from google.colab import files\n",
+        "\n",
+        "print('Upload node_features_labeled.csv and transactions_clean.csv')\n",
+        "uploaded = files.upload()"
+    ],
+    "outputs": [],
+    "execution_count": None
+})
+
+# ==================== CODE: Build graph ====================
+cells.append({
+    "cell_type": "code",
+    "metadata": {},
+    "source": [
+        "# ============================================================\n",
+        "# 4. BUILD PyG GRAPH WITH NODE + EDGE ATTRIBUTES\n",
+        "# ============================================================\n",
+        "nodes_df = pd.read_csv('node_features_labeled.csv')\n",
+        "edges_df = pd.read_csv('transactions_clean.csv')\n",
+        "\n",
+        "print(f'Nodes: {len(nodes_df)}, Edges: {len(edges_df)}')\n",
+        "print(f'Phishing: {nodes_df[\"label\"].sum()}, '\n",
+        "      f'Non-phishing: {(nodes_df[\"label\"]==0).sum()}')\n",
+        "\n",
+        "node_index = {addr: i for i, addr in enumerate(nodes_df['address'])}\n",
+        "\n",
+        "# Node features: in_degree, out_degree, total_in, total_out, balance\n",
+        "node_feat_cols = ['in_degree', 'out_degree', 'total_in', 'total_out', 'balance']\n",
+        "X_raw = nodes_df[node_feat_cols].values.astype(np.float32)\n",
+        "\n",
+        "# Log transform balance (paper: reduce range of balance values)\n",
+        "X_raw[:, 4] = np.log1p(np.abs(X_raw[:, 4])) * np.sign(X_raw[:, 4])\n",
+        "\n",
+        "# Normalize each feature independently\n",
+        "scaler = MinMaxScaler()\n",
+        "X_scaled = scaler.fit_transform(X_raw)\n",
+        "x = torch.tensor(X_scaled, dtype=torch.float)\n",
+        "\n",
+        "# Labels\n",
+        "y = torch.tensor(nodes_df['label'].values, dtype=torch.long)\n",
+        "\n",
+        "# Edge index and edge attributes (timeStamp, value, blockNumber)\n",
+        "edge_src, edge_dst = [], []\n",
+        "edge_attrs = []\n",
+        "\n",
+        "for _, row in edges_df.iterrows():\n",
+        "    if row['from'] in node_index and row['to'] in node_index:\n",
+        "        edge_src.append(node_index[row['from']])\n",
+        "        edge_dst.append(node_index[row['to']])\n",
+        "        edge_attrs.append([\n",
+        "            float(row['timeStamp']),\n",
+        "            float(row['value']),\n",
+        "            float(row['blockNumber'])\n",
+        "        ])\n",
+        "\n",
+        "edge_index = torch.tensor([edge_src, edge_dst], dtype=torch.long)\n",
+        "\n",
+        "# Normalize edge attributes\n",
+        "edge_attr_np = np.array(edge_attrs, dtype=np.float32)\n",
+        "edge_scaler = MinMaxScaler()\n",
+        "edge_attr_scaled = edge_scaler.fit_transform(edge_attr_np)\n",
+        "edge_attr = torch.tensor(edge_attr_scaled, dtype=torch.float)\n",
+        "\n",
+        "# Build PyG Data object\n",
+        "data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)\n",
+        "data = data.to(device)\n",
+        "\n",
+        "print(f'\\nPyG Graph constructed:')\n",
+        "print(f'  Nodes: {data.num_nodes}')\n",
+        "print(f'  Edges: {data.num_edges}')\n",
+        "print(f'  Node features: {data.num_node_features}')\n",
+        "print(f'  Edge features: {data.edge_attr.shape[1]}')\n",
+        "print(f'  Labels distribution: {data.y.unique(return_counts=True)}')"
+    ],
+    "outputs": [],
+    "execution_count": None
+})
+
+# ==================== MARKDOWN: GAE_PDNA ====================
+cells.append({
+    "cell_type": "markdown",
+    "metadata": {},
+    "source": [
+        "## 5. Model 1: GAE_PDNA\n",
+        "\n",
+        "Graph AutoEncoder using Pathfinder Discovery Network (PDN) layers.\n",
+        "\n",
+        "**Architecture (from paper):**\n",
+        "- 4 blocks of: `PDNConv -> PReLU -> GraphNorm`\n",
+        "- Final `PDNConv` layer\n",
+        "- Output embedding dimension: 15\n",
+        "- Edge hidden channels: 6\n",
+        "- Decoder: Inner product decoder for link reconstruction"
+    ]
+})
+
+# ==================== CODE: GAE_PDNA Model ====================
+cells.append({
+    "cell_type": "code",
+    "metadata": {},
+    "source": [
+        "# ============================================================\n",
+        "# 5. GAE_PDNA MODEL DEFINITION\n",
+        "# ============================================================\n",
+        "class PDNBlock(nn.Module):\n",
+        "    \"\"\"Single block: PDNConv -> PReLU -> GraphNorm\"\"\"\n",
+        "    def __init__(self, in_channels, out_channels, edge_dim, edge_hidden):\n",
+        "        super().__init__()\n",
+        "        self.conv = PDNConv(\n",
+        "            in_channels=in_channels,\n",
+        "            out_channels=out_channels,\n",
+        "            edge_dim=edge_dim,\n",
+        "            hidden_channels=edge_hidden\n",
+        "        )\n",
+        "        self.act = nn.PReLU()\n",
+        "        self.norm = GraphNorm(out_channels)\n",
+        "\n",
+        "    def forward(self, x, edge_index, edge_attr):\n",
+        "        x = self.conv(x, edge_index, edge_attr)\n",
+        "        x = self.act(x)\n",
+        "        x = self.norm(x)\n",
+        "        return x\n",
+        "\n",
+        "\n",
+        "class GAE_PDNA_Encoder(nn.Module):\n",
+        "    \"\"\"Encoder: 4 PDN blocks + final PDNConv (paper Section 5.1.4)\"\"\"\n",
+        "    def __init__(self, in_channels, hidden_channels, out_channels,\n",
+        "                 edge_dim, edge_hidden, num_blocks=4):\n",
+        "        super().__init__()\n",
+        "        self.blocks = nn.ModuleList()\n",
+        "\n",
+        "        # First block: in_channels -> hidden_channels\n",
+        "        self.blocks.append(\n",
+        "            PDNBlock(in_channels, hidden_channels, edge_dim, edge_hidden)\n",
+        "        )\n",
+        "        # Remaining blocks: hidden_channels -> hidden_channels\n",
+        "        for _ in range(num_blocks - 1):\n",
+        "            self.blocks.append(\n",
+        "                PDNBlock(hidden_channels, hidden_channels, edge_dim, edge_hidden)\n",
+        "            )\n",
+        "        # Final PDNConv: hidden_channels -> out_channels\n",
+        "        self.final_conv = PDNConv(\n",
+        "            in_channels=hidden_channels,\n",
+        "            out_channels=out_channels,\n",
+        "            edge_dim=edge_dim,\n",
+        "            hidden_channels=edge_hidden\n",
+        "        )\n",
+        "\n",
+        "    def forward(self, x, edge_index, edge_attr):\n",
+        "        for block in self.blocks:\n",
+        "            x = block(x, edge_index, edge_attr)\n",
+        "        x = self.final_conv(x, edge_index, edge_attr)\n",
+        "        return x\n",
+        "\n",
+        "\n",
+        "class InnerProductDecoder(nn.Module):\n",
+        "    \"\"\"Decoder: reconstructs adjacency via inner product of embeddings.\"\"\"\n",
+        "    def forward(self, z, edge_index):\n",
+        "        src, dst = edge_index\n",
+        "        return (z[src] * z[dst]).sum(dim=1)\n",
+        "\n",
+        "\n",
+        "class GAE_PDNA(nn.Module):\n",
+        "    \"\"\"Full Graph AutoEncoder with PDN encoder + inner product decoder.\"\"\"\n",
+        "    def __init__(self, in_channels, hidden_channels=32, out_channels=15,\n",
+        "                 edge_dim=3, edge_hidden=6, num_blocks=4):\n",
+        "        super().__init__()\n",
+        "        self.encoder = GAE_PDNA_Encoder(\n",
+        "            in_channels, hidden_channels, out_channels,\n",
+        "            edge_dim, edge_hidden, num_blocks\n",
+        "        )\n",
+        "        self.decoder = InnerProductDecoder()\n",
+        "\n",
+        "    def encode(self, x, edge_index, edge_attr):\n",
+        "        return self.encoder(x, edge_index, edge_attr)\n",
+        "\n",
+        "    def decode(self, z, edge_index):\n",
+        "        return self.decoder(z, edge_index)\n",
+        "\n",
+        "    def forward(self, x, edge_index, edge_attr):\n",
+        "        z = self.encode(x, edge_index, edge_attr)\n",
+        "        return z\n",
+        "\n",
+        "print('GAE_PDNA model defined.')"
+    ],
+    "outputs": [],
+    "execution_count": None
+})
+
+# ==================== CODE: GAE_PDNA Training ====================
+cells.append({
+    "cell_type": "code",
+    "metadata": {},
+    "source": [
+        "# ============================================================\n",
+        "# 6. GAE_PDNA TRAINING\n",
+        "# ============================================================\n",
+        "# Random link split: 70% train, 10% val, 20% test (paper Section 6.2.2)\n",
+        "transform = RandomLinkSplit(\n",
+        "    num_val=0.1,\n",
+        "    num_test=0.2,\n",
+        "    is_undirected=False,\n",
+        "    add_negative_train_samples=True,\n",
+        "    split_labels=True\n",
+        ")\n",
+        "\n",
+        "train_data, val_data, test_data = transform(data.cpu())\n",
+        "train_data = train_data.to(device)\n",
+        "val_data = val_data.to(device)\n",
+        "test_data = test_data.to(device)\n",
+        "\n",
+        "# Model parameters (paper: in=5 node feats, out=15, edge_hidden=6)\n",
+        "IN_CHANNELS = data.num_node_features  # 5\n",
+        "HIDDEN_CHANNELS = 32\n",
+        "OUT_CHANNELS = 15\n",
+        "EDGE_DIM = 3\n",
+        "EDGE_HIDDEN = 6\n",
+        "NUM_BLOCKS = 4\n",
+        "EPOCHS = 200\n",
+        "LR = 0.01\n",
+        "\n",
+        "model_gae = GAE_PDNA(\n",
+        "    in_channels=IN_CHANNELS,\n",
+        "    hidden_channels=HIDDEN_CHANNELS,\n",
+        "    out_channels=OUT_CHANNELS,\n",
+        "    edge_dim=EDGE_DIM,\n",
+        "    edge_hidden=EDGE_HIDDEN,\n",
+        "    num_blocks=NUM_BLOCKS\n",
+        ").to(device)\n",
+        "\n",
+        "optimizer_gae = Adam(model_gae.parameters(), lr=LR)\n",
+        "\n",
+        "\n",
+        "def gae_loss(z, pos_edge_index, neg_edge_index):\n",
+        "    \"\"\"Binary cross-entropy reconstruction loss.\"\"\"\n",
+        "    pos_scores = model_gae.decode(z, pos_edge_index)\n",
+        "    neg_scores = model_gae.decode(z, neg_edge_index)\n",
+        "\n",
+        "    pos_loss = F.binary_cross_entropy_with_logits(\n",
+        "        pos_scores, torch.ones_like(pos_scores)\n",
+        "    )\n",
+        "    neg_loss = F.binary_cross_entropy_with_logits(\n",
+        "        neg_scores, torch.zeros_like(neg_scores)\n",
+        "    )\n",
+        "    return pos_loss + neg_loss\n",
+        "\n",
+        "\n",
+        "def train_gae_epoch():\n",
+        "    model_gae.train()\n",
+        "    optimizer_gae.zero_grad()\n",
+        "\n",
+        "    z = model_gae.encode(\n",
+        "        train_data.x, train_data.edge_index, train_data.edge_attr\n",
+        "    )\n",
+        "\n",
+        "    pos_edge = train_data.pos_edge_label_index\n",
+        "    neg_edge = train_data.neg_edge_label_index\n",
+        "\n",
+        "    loss = gae_loss(z, pos_edge, neg_edge)\n",
+        "    loss.backward()\n",
+        "    optimizer_gae.step()\n",
+        "    return loss.item()\n",
+        "\n",
+        "\n",
+        "@torch.no_grad()\n",
+        "def eval_gae(split_data):\n",
+        "    model_gae.eval()\n",
+        "    z = model_gae.encode(\n",
+        "        split_data.x, split_data.edge_index, split_data.edge_attr\n",
+        "    )\n",
+        "    pos_edge = split_data.pos_edge_label_index\n",
+        "    neg_edge = split_data.neg_edge_label_index\n",
+        "    loss = gae_loss(z, pos_edge, neg_edge)\n",
+        "    return loss.item()\n",
+        "\n",
+        "\n",
+        "# Training loop (paper: 200 epochs)\n",
+        "print('Training GAE_PDNA...')\n",
+        "train_losses, val_losses = [], []\n",
+        "\n",
+        "for epoch in range(1, EPOCHS + 1):\n",
+        "    t_loss = train_gae_epoch()\n",
+        "    v_loss = eval_gae(val_data)\n",
+        "    train_losses.append(t_loss)\n",
+        "    val_losses.append(v_loss)\n",
+        "\n",
+        "    if epoch % 20 == 0 or epoch == 1:\n",
+        "        print(f'Epoch {epoch:3d} | Train Loss: {t_loss:.4f} | Val Loss: {v_loss:.4f}')\n",
+        "\n",
+        "test_loss = eval_gae(test_data)\n",
+        "print(f'\\nFinal Test Loss: {test_loss:.4f}')\n",
+        "print(f'Final Train Loss: {train_losses[-1]:.4f}')\n",
+        "print(f'Final Val Loss: {val_losses[-1]:.4f}')"
+    ],
+    "outputs": [],
+    "execution_count": None
+})
+
+# ==================== CODE: Loss plot ====================
+cells.append({
+    "cell_type": "code",
+    "metadata": {},
+    "source": [
+        "# ============================================================\n",
+        "# 7. GAE_PDNA LOSS CURVES\n",
+        "# ============================================================\n",
+        "plt.figure(figsize=(10, 5))\n",
+        "plt.plot(train_losses, label='Train Loss')\n",
+        "plt.plot(val_losses, label='Validation Loss')\n",
+        "plt.xlabel('Epoch')\n",
+        "plt.ylabel('Reconstruction Loss')\n",
+        "plt.title('GAE_PDNA Training Curves')\n",
+        "plt.legend()\n",
+        "plt.grid(True, alpha=0.3)\n",
+        "plt.tight_layout()\n",
+        "plt.show()"
+    ],
+    "outputs": [],
+    "execution_count": None
+})
+
+# ==================== CODE: Extract embeddings ====================
+cells.append({
+    "cell_type": "code",
+    "metadata": {},
+    "source": [
+        "# ============================================================\n",
+        "# 8. EXTRACT NODE EMBEDDINGS FROM GAE_PDNA\n",
+        "# ============================================================\n",
+        "model_gae.eval()\n",
+        "with torch.no_grad():\n",
+        "    embeddings_gae = model_gae.encode(\n",
+        "        data.x, data.edge_index, data.edge_attr\n",
+        "    ).cpu().numpy()\n",
+        "\n",
+        "labels_np = data.y.cpu().numpy()\n",
+        "\n",
+        "print(f'GAE_PDNA embeddings shape: {embeddings_gae.shape}')\n",
+        "print(f'  -> {embeddings_gae.shape[0]} nodes x {embeddings_gae.shape[1]} features')"
+    ],
+    "outputs": [],
+    "execution_count": None
+})
+
+# ==================== MARKDOWN: MagNet ====================
+cells.append({
+    "cell_type": "markdown",
+    "metadata": {},
+    "source": [
+        "## 9. Model 2: MagNet Link Prediction\n",
+        "\n",
+        "MagNet uses a complex Hermitian matrix (magnetic Laplacian) for directed graphs.\n",
+        "\n",
+        "**Parameters (from paper):**\n",
+        "- Hidden channels: 8\n",
+        "- q parameter: trainable, initialized to 0.15\n",
+        "- Dropout: 0.8\n",
+        "- Training: 100 epochs"
+    ]
+})
+
+# ==================== CODE: MagNet ====================
+cells.append({
+    "cell_type": "code",
+    "metadata": {},
+    "source": [
+        "# ============================================================\n",
+        "# 9. MAGNET LINK PREDICTION\n",
+        "# ============================================================\n",
+        "from torch_geometric.nn import MagNet\n",
+        "\n",
+        "class MagNetLinkPredictor(nn.Module):\n",
+        "    def __init__(self, in_channels, hidden_channels=8, out_channels=2,\n",
+        "                 num_layers=2, q=0.15, dropout=0.8):\n",
+        "        super().__init__()\n",
+        "        self.magnet = MagNet(\n",
+        "            in_channels=in_channels,\n",
+        "            hidden_channels=hidden_channels,\n",
+        "            out_channels=out_channels,\n",
+        "            num_layers=num_layers,\n",
+        "            q=q,\n",
+        "            dropout=dropout,\n",
+        "            trainable_q=True\n",
+        "        )\n",
+        "\n",
+        "    def forward(self, x, edge_index):\n",
+        "        # MagNet returns real and imaginary parts\n",
+        "        out_real, out_imag = self.magnet(x, edge_index)\n",
+        "        return out_real, out_imag\n",
+        "\n",
+        "    def decode(self, z_real, z_imag, edge_index):\n",
+        "        src, dst = edge_index\n",
+        "        z = torch.cat([z_real, z_imag], dim=1)\n",
+        "        score = (z[src] * z[dst]).sum(dim=1)\n",
+        "        return score\n",
+        "\n",
+        "\n",
+        "model_magnet = MagNetLinkPredictor(\n",
+        "    in_channels=data.num_node_features,\n",
+        "    hidden_channels=8,\n",
+        "    out_channels=2,\n",
+        "    q=0.15,\n",
+        "    dropout=0.8\n",
+        ").to(device)\n",
+        "\n",
+        "optimizer_magnet = Adam(model_magnet.parameters(), lr=0.01)\n",
+        "MAGNET_EPOCHS = 100\n",
+        "\n",
+        "print('Training MagNet Link Prediction...')\n",
+        "\n",
+        "for epoch in range(1, MAGNET_EPOCHS + 1):\n",
+        "    model_magnet.train()\n",
+        "    optimizer_magnet.zero_grad()\n",
+        "\n",
+        "    z_real, z_imag = model_magnet(\n",
+        "        train_data.x, train_data.edge_index\n",
+        "    )\n",
+        "\n",
+        "    pos_edge = train_data.pos_edge_label_index\n",
+        "    neg_edge = train_data.neg_edge_label_index\n",
+        "\n",
+        "    pos_scores = model_magnet.decode(z_real, z_imag, pos_edge)\n",
+        "    neg_scores = model_magnet.decode(z_real, z_imag, neg_edge)\n",
+        "\n",
+        "    scores = torch.cat([pos_scores, neg_scores])\n",
+        "    labels_link = torch.cat([\n",
+        "        torch.ones(pos_scores.size(0)),\n",
+        "        torch.zeros(neg_scores.size(0))\n",
+        "    ]).to(device)\n",
+        "\n",
+        "    loss = F.binary_cross_entropy_with_logits(scores, labels_link)\n",
+        "    loss.backward()\n",
+        "    optimizer_magnet.step()\n",
+        "\n",
+        "    if epoch % 10 == 0 or epoch == 1:\n",
+        "        print(f'Epoch {epoch:3d} | Loss: {loss.item():.4f}')\n",
+        "\n",
+        "print('MagNet training complete.')"
+    ],
+    "outputs": [],
+    "execution_count": None
+})
+
+# ==================== CODE: MagNet evaluation ====================
+cells.append({
+    "cell_type": "code",
+    "metadata": {},
+    "source": [
+        "# ============================================================\n",
+        "# 10. MAGNET EVALUATION (Link Prediction)\n",
+        "# ============================================================\n",
+        "model_magnet.eval()\n",
+        "\n",
+        "with torch.no_grad():\n",
+        "    z_real, z_imag = model_magnet(test_data.x, test_data.edge_index)\n",
+        "\n",
+        "    pos_edge = test_data.pos_edge_label_index\n",
+        "    neg_edge = test_data.neg_edge_label_index\n",
+        "\n",
+        "    pos_scores = torch.sigmoid(model_magnet.decode(z_real, z_imag, pos_edge))\n",
+        "    neg_scores = torch.sigmoid(model_magnet.decode(z_real, z_imag, neg_edge))\n",
+        "\n",
+        "    scores = torch.cat([pos_scores, neg_scores]).cpu().numpy()\n",
+        "    true_labels = np.concatenate([\n",
+        "        np.ones(pos_scores.size(0)),\n",
+        "        np.zeros(neg_scores.size(0))\n",
+        "    ])\n",
+        "    pred_labels = (scores > 0.5).astype(int)\n",
+        "\n",
+        "print('MagNet Link Prediction Results (Test):')\n",
+        "print(classification_report(true_labels, pred_labels, digits=2))\n",
+        "\n",
+        "magnet_auc = roc_auc_score(true_labels, scores)\n",
+        "print(f'AUC Score: {magnet_auc:.4f}')"
+    ],
+    "outputs": [],
+    "execution_count": None
+})
+
+# ==================== MARKDOWN: Baselines ====================
+cells.append({
+    "cell_type": "markdown",
+    "metadata": {},
+    "source": [
+        "## 11. Embedding Baselines: DeepWalk & Node2Vec\n",
+        "\n",
+        "Random walk-based embedding methods for comparison."
+    ]
+})
+
+# ==================== CODE: DeepWalk & Node2Vec ====================
+cells.append({
+    "cell_type": "code",
+    "metadata": {},
+    "source": [
+        "# ============================================================\n",
+        "# 11. DEEPWALK & NODE2VEC EMBEDDINGS\n",
+        "# ============================================================\n",
+        "import networkx as nx\n",
+        "from node2vec import Node2Vec\n",
+        "\n",
+        "# Build NetworkX graph from edge index\n",
+        "edge_list = data.edge_index.cpu().numpy()\n",
+        "G_nx = nx.DiGraph()\n",
+        "G_nx.add_nodes_from(range(data.num_nodes))\n",
+        "for i in range(edge_list.shape[1]):\n",
+        "    G_nx.add_edge(edge_list[0, i], edge_list[1, i])\n",
+        "\n",
+        "print(f'NetworkX graph: {G_nx.number_of_nodes()} nodes, '\n",
+        "      f'{G_nx.number_of_edges()} edges')\n",
+        "\n",
+        "# --- DeepWalk (p=1, q=1, equivalent to unbiased random walk) ---\n",
+        "print('\\nGenerating DeepWalk embeddings...')\n",
+        "dw_model = Node2Vec(\n",
+        "    G_nx, dimensions=15, walk_length=30,\n",
+        "    num_walks=200, workers=2, p=1, q=1\n",
+        ")\n",
+        "dw_fit = dw_model.fit(window=10, min_count=1, batch_words=4)\n",
+        "\n",
+        "embeddings_deepwalk = np.zeros((data.num_nodes, 15))\n",
+        "for node_id in range(data.num_nodes):\n",
+        "    if str(node_id) in dw_fit.wv:\n",
+        "        embeddings_deepwalk[node_id] = dw_fit.wv[str(node_id)]\n",
+        "\n",
+        "print(f'DeepWalk embeddings shape: {embeddings_deepwalk.shape}')\n",
+        "\n",
+        "# --- Node2Vec (p=2, q=0.5, biased random walk) ---\n",
+        "print('\\nGenerating Node2Vec embeddings...')\n",
+        "n2v_model = Node2Vec(\n",
+        "    G_nx, dimensions=15, walk_length=30,\n",
+        "    num_walks=200, workers=2, p=2, q=0.5\n",
+        ")\n",
+        "n2v_fit = n2v_model.fit(window=10, min_count=1, batch_words=4)\n",
+        "\n",
+        "embeddings_node2vec = np.zeros((data.num_nodes, 15))\n",
+        "for node_id in range(data.num_nodes):\n",
+        "    if str(node_id) in n2v_fit.wv:\n",
+        "        embeddings_node2vec[node_id] = n2v_fit.wv[str(node_id)]\n",
+        "\n",
+        "print(f'Node2Vec embeddings shape: {embeddings_node2vec.shape}')"
+    ],
+    "outputs": [],
+    "execution_count": None
+})
+
+# ==================== MARKDOWN: SMOTE ====================
+cells.append({
+    "cell_type": "markdown",
+    "metadata": {},
+    "source": [
+        "## 12. Data Balancing: SMOTE + Undersampling\n",
+        "\n",
+        "**Paper approach:**\n",
+        "- SMOTE oversampling of minority class to 10% of majority\n",
+        "- Random undersampling of majority to achieve 1:1 ratio"
+    ]
+})
+
+# ==================== CODE: SMOTE Balancing ====================
+cells.append({
+    "cell_type": "code",
+    "metadata": {},
+    "source": [
+        "# ============================================================\n",
+        "# 12. DATA BALANCING (SMOTE + Undersampling)\n",
+        "# ============================================================\n",
+        "def balance_dataset(X, y):\n",
+        "    \"\"\"Apply SMOTE oversampling then random undersampling (paper method).\"\"\"\n",
+        "    n_majority = (y == 0).sum()\n",
+        "    n_minority = (y == 1).sum()\n",
+        "\n",
+        "    print(f'Before balancing: majority={n_majority}, minority={n_minority}')\n",
+        "\n",
+        "    if n_minority < 2:\n",
+        "        print('Too few minority samples for SMOTE, using direct oversampling')\n",
+        "        smote_target = max(n_majority // 10, n_minority * 10)\n",
+        "        smote = SMOTE(\n",
+        "            sampling_strategy={1: smote_target},\n",
+        "            k_neighbors=min(n_minority - 1, 5),\n",
+        "            random_state=42\n",
+        "        )\n",
+        "    else:\n",
+        "        smote_target = max(n_majority // 10, n_minority * 2)\n",
+        "        smote = SMOTE(\n",
+        "            sampling_strategy={1: smote_target},\n",
+        "            k_neighbors=min(n_minority - 1, 5),\n",
+        "            random_state=42\n",
+        "        )\n",
+        "\n",
+        "    under = RandomUnderSampler(\n",
+        "        sampling_strategy=1.0,\n",
+        "        random_state=42\n",
+        "    )\n",
+        "\n",
+        "    pipeline = ImbPipeline([\n",
+        "        ('smote', smote),\n",
+        "        ('undersample', under)\n",
+        "    ])\n",
+        "\n",
+        "    X_bal, y_bal = pipeline.fit_resample(X, y)\n",
+        "\n",
+        "    print(f'After balancing: class 0={sum(y_bal==0)}, class 1={sum(y_bal==1)}')\n",
+        "    return X_bal, y_bal\n",
+        "\n",
+        "\n",
+        "# Balance GAE_PDNA embeddings\n",
+        "print('=== Balancing GAE_PDNA embeddings ===')\n",
+        "X_gae_bal, y_gae_bal = balance_dataset(embeddings_gae, labels_np)\n",
+        "\n",
+        "print('\\n=== Balancing DeepWalk embeddings ===')\n",
+        "X_dw_bal, y_dw_bal = balance_dataset(embeddings_deepwalk, labels_np)\n",
+        "\n",
+        "print('\\n=== Balancing Node2Vec embeddings ===')\n",
+        "X_n2v_bal, y_n2v_bal = balance_dataset(embeddings_node2vec, labels_np)"
+    ],
+    "outputs": [],
+    "execution_count": None
+})
+
+# ==================== MARKDOWN: Classification ====================
+cells.append({
+    "cell_type": "markdown",
+    "metadata": {},
+    "source": [
+        "## 13. Classification\n",
+        "\n",
+        "**Classifiers (from paper Table 8):**\n",
+        "- AdaBoost (base: Decision Tree, 100 estimators)\n",
+        "- Random Forest\n",
+        "- Logistic Regression\n",
+        "- Naive Bayes\n",
+        "- One-Class SVM"
+    ]
+})
+
+# ==================== CODE: Classifiers ====================
+cells.append({
+    "cell_type": "code",
+    "metadata": {},
+    "source": [
+        "# ============================================================\n",
+        "# 13. CLASSIFICATION ON GAE_PDNA EMBEDDINGS\n",
+        "# ============================================================\n",
+        "def evaluate_classifiers(X, y, embedding_name):\n",
+        "    \"\"\"Train and evaluate multiple classifiers. Returns results dict.\"\"\"\n",
+        "    X_train, X_test, y_train, y_test = train_test_split(\n",
+        "        X, y, test_size=0.2, random_state=42, stratify=y\n",
+        "    )\n",
+        "\n",
+        "    classifiers = {\n",
+        "        'AdaBoost': AdaBoostClassifier(\n",
+        "            estimator=DecisionTreeClassifier(max_depth=1),\n",
+        "            n_estimators=100, random_state=42\n",
+        "        ),\n",
+        "        'Random Forest': RandomForestClassifier(\n",
+        "            n_estimators=200, class_weight='balanced', random_state=42\n",
+        "        ),\n",
+        "        'Logistic Regression': LogisticRegression(\n",
+        "            max_iter=1000, random_state=42\n",
+        "        ),\n",
+        "        'Naive Bayes': GaussianNB(),\n",
+        "    }\n",
+        "\n",
+        "    results = {}\n",
+        "    print(f'\\n{\"=\"*60}')\n",
+        "    print(f' Classification Results: {embedding_name}')\n",
+        "    print(f'{\"=\"*60}')\n",
+        "\n",
+        "    for name, clf in classifiers.items():\n",
+        "        clf.fit(X_train, y_train)\n",
+        "        y_pred = clf.predict(X_test)\n",
+        "        y_proba = (\n",
+        "            clf.predict_proba(X_test)[:, 1]\n",
+        "            if hasattr(clf, 'predict_proba') else y_pred.astype(float)\n",
+        "        )\n",
+        "\n",
+        "        prec = precision_score(y_test, y_pred, average='micro')\n",
+        "        rec = recall_score(y_test, y_pred, average='micro')\n",
+        "        f1 = f1_score(y_test, y_pred, average='micro')\n",
+        "        try:\n",
+        "            auc = roc_auc_score(y_test, y_proba)\n",
+        "        except ValueError:\n",
+        "            auc = 0.0\n",
+        "\n",
+        "        results[name] = {\n",
+        "            'Precision': prec, 'Recall': rec,\n",
+        "            'F1-Score': f1, 'AUC': auc\n",
+        "        }\n",
+        "\n",
+        "        print(f'\\n--- {name} ---')\n",
+        "        print(classification_report(y_test, y_pred, digits=2))\n",
+        "        print(f'AUC: {auc:.4f}')\n",
+        "\n",
+        "    # One-Class SVM (paper: treats phishing as outliers)\n",
+        "    svm = OneClassSVM(kernel='rbf', gamma='scale', nu=0.5)\n",
+        "    svm.fit(X_train[y_train == 0])  # Train on non-phishing only\n",
+        "    y_svm = svm.predict(X_test)\n",
+        "    y_svm_binary = np.where(y_svm == -1, 1, 0)  # outliers = phishing\n",
+        "\n",
+        "    prec = precision_score(y_test, y_svm_binary, average='micro')\n",
+        "    rec = recall_score(y_test, y_svm_binary, average='micro')\n",
+        "    f1 = f1_score(y_test, y_svm_binary, average='micro')\n",
+        "\n",
+        "    results['One-Class SVM'] = {\n",
+        "        'Precision': prec, 'Recall': rec,\n",
+        "        'F1-Score': f1, 'AUC': 0.0\n",
+        "    }\n",
+        "\n",
+        "    print(f'\\n--- One-Class SVM ---')\n",
+        "    print(classification_report(y_test, y_svm_binary, digits=2))\n",
+        "\n",
+        "    return results, X_train, X_test, y_train, y_test\n",
+        "\n",
+        "\n",
+        "# Evaluate on GAE_PDNA embeddings\n",
+        "results_gae, X_tr_gae, X_te_gae, y_tr_gae, y_te_gae = evaluate_classifiers(\n",
+        "    X_gae_bal, y_gae_bal, 'GAE_PDNA'\n",
+        ")"
+    ],
+    "outputs": [],
+    "execution_count": None
+})
+
+# ==================== CODE: Baseline classifiers ====================
+cells.append({
+    "cell_type": "code",
+    "metadata": {},
+    "source": [
+        "# ============================================================\n",
+        "# 14. CLASSIFICATION ON BASELINE EMBEDDINGS\n",
+        "# ============================================================\n",
+        "# DeepWalk\n",
+        "results_dw, _, _, _, _ = evaluate_classifiers(\n",
+        "    X_dw_bal, y_dw_bal, 'DeepWalk'\n",
+        ")\n",
+        "\n",
+        "# Node2Vec\n",
+        "results_n2v, _, _, _, _ = evaluate_classifiers(\n",
+        "    X_n2v_bal, y_n2v_bal, 'Node2Vec'\n",
+        ")"
+    ],
+    "outputs": [],
+    "execution_count": None
+})
+
+# ==================== MARKDOWN: Comparison ====================
+cells.append({
+    "cell_type": "markdown",
+    "metadata": {},
+    "source": [
+        "## 15. Comparative Analysis\n",
+        "\n",
+        "Reproducing Tables 7 and 8 from the paper."
+    ]
+})
+
+# ==================== CODE: Comparison Tables ====================
+cells.append({
+    "cell_type": "code",
+    "metadata": {},
+    "source": [
+        "# ============================================================\n",
+        "# 15. COMPARATIVE ANALYSIS TABLES\n",
+        "# ============================================================\n",
+        "\n",
+        "# --- Table 7: Embedding Algorithm Comparison (best classifier each) ---\n",
+        "print('=' * 65)\n",
+        "print(' Table 7: Performance Comparison - Embedding Algorithms')\n",
+        "print(' (Using AdaBoost classifier for each)')\n",
+        "print('=' * 65)\n",
+        "\n",
+        "embedding_comparison = {\n",
+        "    'DeepWalk': results_dw.get('AdaBoost', {}),\n",
+        "    'Node2Vec': results_n2v.get('AdaBoost', {}),\n",
+        "    'GAE_PDNA': results_gae.get('AdaBoost', {}),\n",
+        "}\n",
+        "\n",
+        "df_embed = pd.DataFrame(embedding_comparison).T\n",
+        "print(df_embed.round(2).to_string())\n",
+        "\n",
+        "# --- Table 8: Classifier Comparison (using GAE_PDNA embeddings) ---\n",
+        "print(f'\\n{\"=\" * 65}')\n",
+        "print(' Table 8: Performance Comparison - Classifiers (GAE_PDNA)')\n",
+        "print('=' * 65)\n",
+        "\n",
+        "df_clf = pd.DataFrame(results_gae).T\n",
+        "print(df_clf.round(2).to_string())\n",
+        "\n",
+        "# --- Table 6: AUC Scores ---\n",
+        "print(f'\\n{\"=\" * 65}')\n",
+        "print(' Table 6: AUC Scores')\n",
+        "print('=' * 65)\n",
+        "if 'AUC' in results_gae.get('AdaBoost', {}):\n",
+        "    print(f'  MagNet:   {magnet_auc * 100:.2f}')\n",
+        "    print(f'  GAE_PDNA: {results_gae[\"AdaBoost\"][\"AUC\"] * 100:.2f}')"
+    ],
+    "outputs": [],
+    "execution_count": None
+})
+
+# ==================== MARKDOWN: t-SNE ====================
+cells.append({
+    "cell_type": "markdown",
+    "metadata": {},
+    "source": [
+        "## 16. t-SNE Visualization\n",
+        "\n",
+        "2D visualization of GAE_PDNA node embeddings (paper Figure 4)."
+    ]
+})
+
+# ==================== CODE: t-SNE ====================
+cells.append({
+    "cell_type": "code",
+    "metadata": {},
+    "source": [
+        "# ============================================================\n",
+        "# 16. t-SNE VISUALIZATION OF NODE EMBEDDINGS\n",
+        "# ============================================================\n",
+        "print('Running t-SNE on balanced GAE_PDNA embeddings...')\n",
+        "\n",
+        "tsne = TSNE(n_components=2, random_state=42, perplexity=30)\n",
+        "X_tsne = tsne.fit_transform(X_gae_bal)\n",
+        "\n",
+        "plt.figure(figsize=(12, 8))\n",
+        "\n",
+        "# Non-phishing (blue)\n",
+        "mask_0 = y_gae_bal == 0\n",
+        "plt.scatter(\n",
+        "    X_tsne[mask_0, 0], X_tsne[mask_0, 1],\n",
+        "    c='blue', alpha=0.4, s=10, label='Non-Phishing'\n",
+        ")\n",
+        "\n",
+        "# Phishing (red)\n",
+        "mask_1 = y_gae_bal == 1\n",
+        "plt.scatter(\n",
+        "    X_tsne[mask_1, 0], X_tsne[mask_1, 1],\n",
+        "    c='red', alpha=0.6, s=15, label='Phishing'\n",
+        ")\n",
+        "\n",
+        "plt.title('t-SNE: GAE_PDNA Node Embeddings (Balanced Dataset)', fontsize=14)\n",
+        "plt.xlabel('t-SNE Dimension 1')\n",
+        "plt.ylabel('t-SNE Dimension 2')\n",
+        "plt.legend(fontsize=12)\n",
+        "plt.grid(True, alpha=0.2)\n",
+        "plt.tight_layout()\n",
+        "plt.savefig('tsne_gae_pdna.png', dpi=300)\n",
+        "plt.show()\n",
+        "\n",
+        "print('Saved: tsne_gae_pdna.png')"
+    ],
+    "outputs": [],
+    "execution_count": None
+})
+
+# ==================== CODE: Bar chart ====================
+cells.append({
+    "cell_type": "code",
+    "metadata": {},
+    "source": [
+        "# ============================================================\n",
+        "# 17. RESULTS BAR CHART\n",
+        "# ============================================================\n",
+        "fig, axes = plt.subplots(1, 2, figsize=(16, 6))\n",
+        "\n",
+        "# Chart 1: Embedding comparison\n",
+        "df_embed_plot = pd.DataFrame(embedding_comparison).T[['Precision', 'Recall', 'F1-Score']]\n",
+        "df_embed_plot.plot(kind='bar', ax=axes[0], rot=0)\n",
+        "axes[0].set_title('Embedding Algorithm Comparison (AdaBoost)')\n",
+        "axes[0].set_ylim(0, 1.05)\n",
+        "axes[0].legend(loc='lower right')\n",
+        "axes[0].grid(axis='y', alpha=0.3)\n",
+        "\n",
+        "# Chart 2: Classifier comparison on GAE_PDNA\n",
+        "df_clf_plot = pd.DataFrame(results_gae).T[['Precision', 'Recall', 'F1-Score']]\n",
+        "df_clf_plot.plot(kind='bar', ax=axes[1], rot=15)\n",
+        "axes[1].set_title('Classifier Comparison (GAE_PDNA Embeddings)')\n",
+        "axes[1].set_ylim(0, 1.05)\n",
+        "axes[1].legend(loc='lower right')\n",
+        "axes[1].grid(axis='y', alpha=0.3)\n",
+        "\n",
+        "plt.tight_layout()\n",
+        "plt.savefig('comparison_charts.png', dpi=300)\n",
+        "plt.show()\n",
+        "\n",
+        "print('Saved: comparison_charts.png')"
+    ],
+    "outputs": [],
+    "execution_count": None
+})
+
+# ==================== CODE: Save model ====================
+cells.append({
+    "cell_type": "code",
+    "metadata": {},
+    "source": [
+        "# ============================================================\n",
+        "# 18. SAVE TRAINED MODELS & EMBEDDINGS\n",
+        "# ============================================================\n",
+        "torch.save(model_gae.state_dict(), 'gae_pdna_model.pth')\n",
+        "np.save('embeddings_gae_pdna.npy', embeddings_gae)\n",
+        "np.save('embeddings_deepwalk.npy', embeddings_deepwalk)\n",
+        "np.save('embeddings_node2vec.npy', embeddings_node2vec)\n",
+        "\n",
+        "print('Saved:')\n",
+        "print('  gae_pdna_model.pth       - GAE_PDNA model weights')\n",
+        "print('  embeddings_gae_pdna.npy  - GAE_PDNA node embeddings')\n",
+        "print('  embeddings_deepwalk.npy  - DeepWalk node embeddings')\n",
+        "print('  embeddings_node2vec.npy  - Node2Vec node embeddings')"
+    ],
+    "outputs": [],
+    "execution_count": None
+})
+
+# ==================== MARKDOWN: Summary ====================
+cells.append({
+    "cell_type": "markdown",
+    "metadata": {},
+    "source": [
+        "## Summary\n",
+        "\n",
+        "### Models Implemented:\n",
+        "| Model | Type | Details |\n",
+        "|-------|------|---------|\n",
+        "| GAE_PDNA | Graph AutoEncoder | 4 PDNConv blocks + decoder, 200 epochs |\n",
+        "| MagNet | Link Prediction | Magnetic Laplacian, 100 epochs |\n",
+        "| DeepWalk | Walk Embedding | Unbiased random walk + Skip-gram |\n",
+        "| Node2Vec | Walk Embedding | Biased random walk + Skip-gram |\n",
+        "\n",
+        "### Classifiers:\n",
+        "| Classifier | Notes |\n",
+        "|-----------|-------|\n",
+        "| AdaBoost | Decision tree base, 100 estimators |\n",
+        "| Random Forest | 200 trees, balanced weights |\n",
+        "| Logistic Regression | Standard |\n",
+        "| Naive Bayes | Gaussian |\n",
+        "| One-Class SVM | Outlier detection approach |"
+    ]
+})
+
+# ==================== BUILD NOTEBOOK ====================
+nb = {
+    "nbformat": 4,
+    "nbformat_minor": 0,
+    "metadata": {
+        "accelerator": "GPU",
+        "colab": {"provenance": [], "gpuType": "T4"},
+        "kernelspec": {"display_name": "Python 3", "name": "python3"},
+        "language_info": {"name": "python"}
+    },
+    "cells": cells
+}
+
+with open("phishing_detection_training.ipynb", "w", encoding="utf-8") as f:
+    json.dump(nb, f, indent=2, ensure_ascii=False)
+
+print("Notebook created: phishing_detection_training.ipynb")
+print(f"Total cells: {len(cells)}")
